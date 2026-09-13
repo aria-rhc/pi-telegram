@@ -17,6 +17,9 @@
   "pi": {
     "extensions": ["./index.ts"]
   },
+  "bin": {
+    "pi-telegram": "./cli.js"
+  },
   "peerDependencies": {
     "@mariozechner/pi-ai": "*",
     "@mariozechner/pi-agent-core": "*",
