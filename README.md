@@ -134,6 +134,37 @@ It tries Telegram draft streaming first with `sendMessageDraft`. If that is not 
 - Long replies are split below Telegram's 4096 character limit
 - Outbound files are sent via `telegram_attach`
 
+### Proactive sends (telegram_send tool)
+
+The agent can push a message to the paired Telegram chat at any time — even when the current turn was not triggered from Telegram (e.g. an out-of-band wake-up from another session) — by calling the `telegram_send` tool. It is not bound to an active Telegram turn, so it never gets mis-dropped by turn binding. Normal Telegram conversations are unaffected: replies to `[telegram]` messages still work exactly as before.
+
+### CLI
+
+The package also ships a small companion CLI (no dependencies, reads the same `~/.pi/agent/telegram.json` config):
+
+```bash
+pi-telegram send "build finished, reports at /tmp/report.md"
+cat summary.txt | pi-telegram send
+```
+
+This lets scripts and non-agent runners notify the paired chat without going through a pi session.
+
+## Changes vs upstream
+
+This fork (`aria-rhc/pi-telegram`, branch `telegram-send-and-fixes`) extends `badlogic/pi-telegram` with the following changes (see richardchew/aria issue #134):
+
+- **`telegram_send` tool** — proactive text messaging to the paired chat (`chat_id = config.allowedUserId`), registered alongside `telegram_attach`. Works with no active Telegram turn and no turn binding, so out-of-band reports are delivered deterministically instead of relying on turn replies.
+- **`pi-telegram` CLI** — `pi-telegram send` reads the same config and sends text to the paired chat from scripts or other non-agent callers.
+- **Queue-starvation fix** — `agent_end` used to early-return when the finished turn had no active Telegram turn, skipping the queue-dispatch code. A Telegram message arriving while a non-Telegram turn was running could sit stuck until the next Telegram message. Queued Telegram turns are now dispatched regardless of what kind of turn just ended.
+- **Send-path hardening** —
+  - `callTelegram` / `callTelegramMultipart` retry transient failures (network errors, HTTP 429/5xx, non-JSON error pages) with exponential backoff + jitter, honouring `retry_after`; aborts are never retried.
+  - API failures surface as a typed `TelegramApiError` carrying `error_code` / `retry_after`.
+  - No floating promises: fire-and-forget calls (preview flush timer, compaction notifications, media-group dispatch) all have `.catch` handlers.
+  - `finalizePreview` in `agent_end` is wrapped in try/catch with a plain `sendMessage` fallback, so a draft/preview failure can no longer eat the final reply.
+- **Tooling** — `tsconfig.json` added; typecheck with `npx tsc --noEmit`.
+
+Normal turn-reply behaviour (implicit replies to `[telegram]` messages, streaming previews, attachments) is unchanged.
+
 ## License
 
 MIT
