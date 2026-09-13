@@ -246,8 +246,9 @@ const SYSTEM_PROMPT_SUFFIX = `
 Telegram bridge extension is active.
 - Messages forwarded from Telegram are prefixed with "[telegram]".
 - [telegram] messages may include local temp file paths for Telegram attachments. Read those files as needed.
-- If a [telegram] user asked for a file or generated artifact, use the telegram_attach tool with the local file path so the extension can send it with your next final reply.
-- Do not assume mentioning a local file path in plain text will send it to Telegram. Use telegram_attach.`;
+- If a [telegram] user asked for a file or generated artifact, call telegram_attach with the local file path so the extension can send it with your next final reply.
+- Do not assume mentioning a local file path in plain text will send it to Telegram. Use telegram_attach.
+- To proactively send a message to the paired Telegram chat (e.g. a report triggered by a non-Telegram wake-up), use the telegram_send tool. It works at any time and does not require an active Telegram turn.`;
 
 function isTelegramPrompt(prompt: string): boolean {
 	return prompt.trimStart().startsWith(TELEGRAM_PREFIX);
@@ -1058,6 +1059,36 @@ export default function (pi: ExtensionAPI) {
 			return {
 				content: [{ type: "text", text: `Queued ${added.length} Telegram attachment(s).` }],
 				details: { paths: added },
+			};
+		},
+	});
+
+	pi.registerTool({
+		name: "telegram_send",
+		label: "Telegram Send",
+		description: "Send a text message to the paired Telegram chat immediately. Works at any time, with or without an active Telegram turn (proactive send).",
+		promptSnippet: "Send a text message to the paired Telegram chat immediately, without needing an active Telegram turn.",
+		promptGuidelines: [
+			"Use telegram_send to proactively notify the paired Telegram chat (e.g. a report triggered by a non-Telegram wake-up); it is not bound to any turn.",
+		],
+		parameters: Type.Object({
+			text: Type.String({ description: "Message text to send" }),
+		}),
+		async execute(_toolCallId, params) {
+			const text = params.text.trim();
+			if (!text) {
+				throw new Error("telegram_send requires non-empty text");
+			}
+			if (!config.botToken) {
+				throw new Error("Telegram bot token is not configured (run /telegram-setup)");
+			}
+			if (config.allowedUserId === undefined) {
+				throw new Error("Telegram chat is not paired yet (send /start to the bot first)");
+			}
+			await sendTextReply(config.allowedUserId, 0, text);
+			return {
+				content: [{ type: "text", text: "Sent to Telegram." }],
+				details: { chatId: config.allowedUserId, length: text.length },
 			};
 		},
 	});
