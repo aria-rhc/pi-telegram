@@ -923,7 +923,10 @@ export default function (pi: ExtensionAPI) {
 		if (ctx.isIdle()) {
 			startTypingLoop(ctx, turn.chatId);
 			updateStatus(ctx);
-			pi.sendUserMessage(turn.content);
+			// deliverAs: followUp — pi queues the message if a turn starts in the
+			// race window between the isIdle() check and this send, instead of
+			// throwing "Agent is already processing" and stranding the turn.
+			pi.sendUserMessage(turn.content, { deliverAs: "followUp" });
 		}
 	}
 
@@ -1251,7 +1254,10 @@ export default function (pi: ExtensionAPI) {
 			const nextTurn = queuedTelegramTurns[0];
 			startTypingLoop(ctx, nextTurn.chatId);
 			updateStatus(ctx);
-			pi.sendUserMessage(nextTurn.content);
+			// deliverAs: followUp — pi queues the message if a turn starts in the
+			// race window between turn end and this send, instead of throwing
+			// "Agent is already processing" and stranding the turn.
+			pi.sendUserMessage(nextTurn.content, { deliverAs: "followUp" });
 		}
 	});
 }
