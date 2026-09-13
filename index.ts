@@ -20,6 +20,9 @@ interface TelegramApiResponse<T> {
 	result?: T;
 	description?: string;
 	error_code?: number;
+	parameters?: {
+		retry_after?: number;
+	};
 }
 
 interface TelegramUser {
@@ -159,6 +162,84 @@ const MAX_ATTACHMENTS_PER_TURN = 10;
 const PREVIEW_THROTTLE_MS = 750;
 const TELEGRAM_DRAFT_ID_MAX = 2_147_483_647;
 const TELEGRAM_MEDIA_GROUP_DEBOUNCE_MS = 1200;
+const TELEGRAM_RETRY_MAX_ATTEMPTS = 3;
+const TELEGRAM_RETRY_BASE_DELAY_MS = 1000;
+const RETRYABLE_TELEGRAM_ERROR_CODES = new Set([429, 500, 502, 503, 504]);
+
+class TelegramApiError extends Error {
+	readonly errorCode: number | undefined;
+	readonly retryAfterMs: number | undefined;
+
+	constructor(description: string, errorCode?: number, retryAfterMs?: number) {
+		super(description);
+		this.name = "TelegramApiError";
+		this.errorCode = errorCode;
+		this.retryAfterMs = retryAfterMs;
+	}
+
+	get retryable(): boolean {
+		return this.errorCode !== undefined && RETRYABLE_TELEGRAM_ERROR_CODES.has(this.errorCode);
+	}
+}
+
+function sleep(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isAbortError(error: unknown): boolean {
+	return error instanceof DOMException && error.name === "AbortError";
+}
+
+function getRetryDelayMs(error: unknown, attempt: number): number | undefined {
+	if (isAbortError(error)) return undefined;
+	if (error instanceof TelegramApiError) {
+		if (!error.retryable) return undefined;
+		if (error.retryAfterMs !== undefined) return error.retryAfterMs;
+	} else if (!(error instanceof TypeError)) {
+		// TypeError is what fetch throws for network-level failures; anything else
+		// is a local error and is not worth retrying.
+		return undefined;
+	}
+	const backoff = TELEGRAM_RETRY_BASE_DELAY_MS * 2 ** (attempt - 1);
+	return backoff + Math.random() * TELEGRAM_RETRY_BASE_DELAY_MS;
+}
+
+async function withRetry<T>(fn: () => Promise<T>, options?: { signal?: AbortSignal }): Promise<T> {
+	let lastError: unknown;
+	for (let attempt = 1; attempt <= TELEGRAM_RETRY_MAX_ATTEMPTS; attempt++) {
+		try {
+			return await fn();
+		} catch (error) {
+			lastError = error;
+			if (options?.signal?.aborted || isAbortError(error)) throw error;
+			const delay = getRetryDelayMs(error, attempt);
+			if (delay === undefined || attempt >= TELEGRAM_RETRY_MAX_ATTEMPTS) throw error;
+			await sleep(delay);
+			if (options?.signal?.aborted) throw error;
+		}
+	}
+	throw lastError;
+}
+
+async function parseTelegramResponse<TResponse>(method: string, response: Response): Promise<TResponse> {
+	let data: TelegramApiResponse<TResponse>;
+	try {
+		data = (await response.json()) as TelegramApiResponse<TResponse>;
+	} catch {
+		// Non-JSON body (e.g. an HTML error page from an intermediary) — treat the
+		// HTTP status as the error code so 429/5xx stay retryable.
+		throw new TelegramApiError(`Telegram API ${method} failed: HTTP ${response.status}`, response.status);
+	}
+	if (!data.ok || data.result === undefined) {
+		const retryAfterMs = data.parameters?.retry_after !== undefined ? data.parameters.retry_after * 1000 : undefined;
+		throw new TelegramApiError(
+			data.description || `Telegram API ${method} failed`,
+			data.error_code ?? (response.ok ? undefined : response.status),
+			retryAfterMs,
+		);
+	}
+	return data.result;
+}
 
 const SYSTEM_PROMPT_SUFFIX = `
 
@@ -336,18 +417,17 @@ export default function (pi: ExtensionAPI) {
 		body: Record<string, unknown>,
 		options?: { signal?: AbortSignal },
 	): Promise<TResponse> {
-		if (!config.botToken) throw new Error("Telegram bot token is not configured");
-		const response = await fetch(`https://api.telegram.org/bot${config.botToken}/${method}`, {
-			method: "POST",
-			headers: { "content-type": "application/json" },
-			body: JSON.stringify(body),
-			signal: options?.signal,
-		});
-			const data = (await response.json()) as TelegramApiResponse<TResponse>;
-		if (!data.ok || data.result === undefined) {
-			throw new Error(data.description || `Telegram API ${method} failed`);
-		}
-		return data.result;
+		const botToken = config.botToken;
+		if (!botToken) throw new Error("Telegram bot token is not configured");
+		return withRetry(async () => {
+			const response = await fetch(`https://api.telegram.org/bot${botToken}/${method}`, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify(body),
+				signal: options?.signal,
+			});
+			return parseTelegramResponse<TResponse>(method, response);
+		}, { signal: options?.signal });
 	}
 
 	async function callTelegramMultipart<TResponse>(
@@ -358,23 +438,22 @@ export default function (pi: ExtensionAPI) {
 		fileName: string,
 		options?: { signal?: AbortSignal },
 	): Promise<TResponse> {
-		if (!config.botToken) throw new Error("Telegram bot token is not configured");
+		const botToken = config.botToken;
+		if (!botToken) throw new Error("Telegram bot token is not configured");
 		const form = new FormData();
 		for (const [key, value] of Object.entries(fields)) {
 			form.set(key, value);
 		}
 		const buffer = await readFile(filePath);
 		form.set(fileField, new Blob([buffer]), fileName);
-		const response = await fetch(`https://api.telegram.org/bot${config.botToken}/${method}`, {
-			method: "POST",
-			body: form,
-			signal: options?.signal,
-		});
-		const data = (await response.json()) as TelegramApiResponse<TResponse>;
-		if (!data.ok || data.result === undefined) {
-			throw new Error(data.description || `Telegram API ${method} failed`);
-		}
-		return data.result;
+		return withRetry(async () => {
+			const response = await fetch(`https://api.telegram.org/bot${botToken}/${method}`, {
+				method: "POST",
+				body: form,
+				signal: options?.signal,
+			});
+			return parseTelegramResponse<TResponse>(method, response);
+		}, { signal: options?.signal });
 	}
 
 	async function downloadTelegramFile(fileId: string, suggestedName: string): Promise<string> {
@@ -383,7 +462,7 @@ export default function (pi: ExtensionAPI) {
 		await mkdir(TEMP_DIR, { recursive: true });
 		const targetPath = join(TEMP_DIR, `${Date.now()}-${sanitizeFileName(suggestedName)}`);
 		const response = await fetch(`https://api.telegram.org/file/bot${config.botToken}/${file.file_path}`);
-		if (!response.ok) throw new Error(`Failed to download Telegram file: ${response.status}`);
+		if (!response.ok) throw new TelegramApiError(`Failed to download Telegram file: HTTP ${response.status}`, response.status);
 		const arrayBuffer = await response.arrayBuffer();
 		await writeFile(targetPath, Buffer.from(arrayBuffer));
 		return targetPath;
@@ -483,7 +562,9 @@ export default function (pi: ExtensionAPI) {
 	function schedulePreviewFlush(chatId: number): void {
 		if (!previewState || previewState.flushTimer) return;
 		previewState.flushTimer = setTimeout(() => {
-			void flushPreview(chatId);
+			// Preview flushes are best-effort; the final reply path in agent_end has
+			// its own error handling and fallback.
+			void flushPreview(chatId).catch(() => undefined);
 		}, PREVIEW_THROTTLE_MS);
 	}
 
@@ -762,11 +843,11 @@ export default function (pi: ExtensionAPI) {
 			}
 			ctx.compact({
 				onComplete: () => {
-					void sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Compaction completed.");
+					void sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Compaction completed.").catch(() => undefined);
 				},
 				onError: (error) => {
 					const message = error instanceof Error ? error.message : String(error);
-					void sendTextReply(firstMessage.chat.id, firstMessage.message_id, `Compaction failed: ${message}`);
+					void sendTextReply(firstMessage.chat.id, firstMessage.message_id, `Compaction failed: ${message}`).catch(() => undefined);
 				},
 			});
 			await sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Compaction started.");
@@ -855,7 +936,10 @@ export default function (pi: ExtensionAPI) {
 				const state = mediaGroups.get(key);
 				mediaGroups.delete(key);
 				if (!state) return;
-				void dispatchAuthorizedTelegramMessages(state.messages, ctx);
+				void dispatchAuthorizedTelegramMessages(state.messages, ctx).catch((error) => {
+				const message = error instanceof Error ? error.message : String(error);
+				updateStatus(ctx, `dispatch failed: ${message}`);
+			});
 			}, TELEGRAM_MEDIA_GROUP_DEBOUNCE_MS);
 			mediaGroups.set(key, existing);
 			return;
