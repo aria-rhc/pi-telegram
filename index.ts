@@ -1170,40 +1170,52 @@ export default function (pi: ExtensionAPI) {
 		stopTypingLoop();
 		activeTelegramTurn = undefined;
 		updateStatus(ctx);
-		if (!turn) return;
 
-		const assistant = extractAssistantText(event.messages);
-		if (assistant.stopReason === "aborted") {
-			await clearPreview(turn.chatId);
-			return;
-		}
-		if (assistant.stopReason === "error") {
-			await clearPreview(turn.chatId);
-			await sendTextReply(turn.chatId, turn.replyToMessageId, assistant.errorMessage || "Telegram bridge: pi failed while processing the request.");
-			return;
-		}
+		if (turn) {
+			const assistant = extractAssistantText(event.messages);
+			if (assistant.stopReason === "aborted") {
+				await clearPreview(turn.chatId);
+			} else if (assistant.stopReason === "error") {
+				await clearPreview(turn.chatId);
+				await sendTextReply(turn.chatId, turn.replyToMessageId, assistant.errorMessage || "Telegram bridge: pi failed while processing the request.");
+			} else {
+				const finalText = assistant.text;
+				if (previewState) {
+					previewState.pendingText = finalText ?? previewState.pendingText;
+				}
 
-		const finalText = assistant.text;
-		if (previewState) {
-			previewState.pendingText = finalText ?? previewState.pendingText;
-		}
+				if (finalText && finalText.length <= MAX_MESSAGE_LENGTH) {
+					let finalized = false;
+					try {
+						finalized = await finalizePreview(turn.chatId);
+					} catch (error) {
+						// Preview/draft finalization is best-effort; fall back to a plain
+						// sendMessage so the reply still lands.
+						const message = error instanceof Error ? error.message : String(error);
+						updateStatus(ctx, `reply failed: ${message}`);
+						await clearPreview(turn.chatId);
+						await sendTextReply(turn.chatId, turn.replyToMessageId, finalText);
+						finalized = true;
+					}
+					if (!finalized && turn.queuedAttachments.length > 0 && !finalText) {
+						await sendTextReply(turn.chatId, turn.replyToMessageId, "Attached requested file(s).");
+					}
+				} else {
+					await clearPreview(turn.chatId);
+					if (finalText) {
+						await sendTextReply(turn.chatId, turn.replyToMessageId, finalText);
+					} else if (turn.queuedAttachments.length > 0) {
+						await sendTextReply(turn.chatId, turn.replyToMessageId, "Attached requested file(s).");
+					}
+				}
 
-		if (finalText && finalText.length <= MAX_MESSAGE_LENGTH) {
-			const finalized = await finalizePreview(turn.chatId);
-			if (!finalized && turn.queuedAttachments.length > 0 && !finalText) {
-				await sendTextReply(turn.chatId, turn.replyToMessageId, "Attached requested file(s).");
+				await sendQueuedAttachments(turn);
 			}
-		} else {
-			await clearPreview(turn.chatId);
-			if (finalText) {
-				await sendTextReply(turn.chatId, turn.replyToMessageId, finalText);
-			} else if (turn.queuedAttachments.length > 0) {
-				await sendTextReply(turn.chatId, turn.replyToMessageId, "Attached requested file(s).");
-			}
 		}
 
-		await sendQueuedAttachments(turn);
-
+		// Dispatch queued Telegram turns even when the turn that just ended was
+		// not Telegram-originated (e.g. an out-of-band wake-up), so queued
+		// messages cannot starve behind non-Telegram work.
 		if (queuedTelegramTurns.length > 0 && !preserveQueuedTurnsAsHistory) {
 			const nextTurn = queuedTelegramTurns[0];
 			startTypingLoop(ctx, nextTurn.chatId);
