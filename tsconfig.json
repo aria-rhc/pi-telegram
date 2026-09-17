@@ -8,7 +8,16 @@
 		"strict": true,
 		"noEmit": true,
 		"skipLibCheck": true,
-		"forceConsistentCasingInFileNames": true
+		"forceConsistentCasingInFileNames": true,
+		"baseUrl": ".",
+		// Type against the runtime's pi-coding-agent (the earendil fork bundles and
+		// aliases the @mariozechner specifier to itself, so the import stays
+		// compatible with both upstream and fork runtimes).
+		"paths": {
+			"@mariozechner/pi-coding-agent": ["node_modules/@earendil-works/pi-coding-agent/dist/index.d.ts"],
+			"@mariozechner/pi-agent-core": ["node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-agent-core/dist/index.d.ts"],
+			"@mariozechner/pi-ai": ["node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-ai/dist/index.d.ts"]
+		}
 	},
 	"include": ["index.ts"]
 }

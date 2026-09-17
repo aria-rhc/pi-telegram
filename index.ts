@@ -375,6 +375,12 @@ export default function (pi: ExtensionAPI) {
 	let typingInterval: ReturnType<typeof setInterval> | undefined;
 	let currentAbort: (() => void) | undefined;
 	let preserveQueuedTurnsAsHistory = false;
+	// Whether the prompt that initiated the current agent run came from Telegram.
+	// Set in before_agent_start (the only event that sees the initiating prompt);
+	// agent_start/agent_end fire per low-level run, and pi starts additional runs
+	// (auto-retry, auto-compaction, follow-up drains) without re-firing
+	// before_agent_start, so the flag must persist across those runs.
+	let currentTurnIsTelegram = false;
 	let setupInProgress = false;
 	let previewState: TelegramPreviewState | undefined;
 	let draftSupport: "unknown" | "supported" | "unsupported" = "unknown";
@@ -923,10 +929,13 @@ export default function (pi: ExtensionAPI) {
 		if (ctx.isIdle()) {
 			startTypingLoop(ctx, turn.chatId);
 			updateStatus(ctx);
-			// deliverAs: followUp — pi queues the message if a turn starts in the
-			// race window between the isIdle() check and this send, instead of
-			// throwing "Agent is already processing" and stranding the turn.
-			pi.sendUserMessage(turn.content, { deliverAs: "followUp" });
+			// No deliverAs on purpose: if a turn starts in the race window between
+			// the isIdle() check and this send, a plain send throws (swallowed by
+			// the extension host) and the turn stays queued until the next
+			// agent_settled retries the dispatch. A followUp send would instead
+			// drain the message inside that other run — whose prompt may not be
+			// Telegram-originated — losing its reply delivery.
+			pi.sendUserMessage(turn.content);
 		}
 	}
 
@@ -1156,10 +1165,12 @@ export default function (pi: ExtensionAPI) {
 		activeTelegramTurn = undefined;
 		currentAbort = undefined;
 		preserveQueuedTurnsAsHistory = false;
+		currentTurnIsTelegram = false;
 		await stopPolling();
 	});
 
 	pi.on("before_agent_start", async (event) => {
+		currentTurnIsTelegram = isTelegramPrompt(event.prompt);
 		const suffix = isTelegramPrompt(event.prompt)
 			? `${SYSTEM_PROMPT_SUFFIX}\n- The current user message came from Telegram.`
 			: SYSTEM_PROMPT_SUFFIX;
@@ -1170,7 +1181,13 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("agent_start", async (_event, ctx) => {
 		currentAbort = () => ctx.abort();
-		if (!activeTelegramTurn && queuedTelegramTurns.length > 0) {
+		// Only attach a queued Telegram turn to runs whose initiating prompt was a
+		// Telegram message. Wake-up turns (tmux-injected prompts) can start while
+		// the queue is non-empty; without this guard they would steal the queue
+		// head here and their final text would be delivered to Telegram as a
+		// "reply" at agent_end, while the queued message's content was never sent
+		// as a prompt at all.
+		if (currentTurnIsTelegram && !activeTelegramTurn && queuedTelegramTurns.length > 0) {
 			const nextTurn = queuedTelegramTurns.shift();
 			if (nextTurn) {
 				activeTelegramTurn = { ...nextTurn };
@@ -1246,18 +1263,26 @@ export default function (pi: ExtensionAPI) {
 				await sendQueuedAttachments(turn);
 			}
 		}
+	});
 
-		// Dispatch queued Telegram turns even when the turn that just ended was
-		// not Telegram-originated (e.g. an out-of-band wake-up), so queued
-		// messages cannot starve behind non-Telegram work.
-		if (queuedTelegramTurns.length > 0 && !preserveQueuedTurnsAsHistory) {
-			const nextTurn = queuedTelegramTurns[0];
-			startTypingLoop(ctx, nextTurn.chatId);
-			updateStatus(ctx);
-			// deliverAs: followUp — pi queues the message if a turn starts in the
-			// race window between turn end and this send, instead of throwing
-			// "Agent is already processing" and stranding the turn.
-			pi.sendUserMessage(nextTurn.content, { deliverAs: "followUp" });
-		}
+	// Dispatch queued Telegram turns once the session is fully idle, including
+	// after turns that were not Telegram-originated (e.g. out-of-band wake-ups),
+	// so queued messages cannot starve behind non-Telegram work. This must not
+	// happen in agent_end: during that handler the agent run is still active
+	// (isStreaming is true for the whole run), so a plain send throws and a
+	// followUp send gets drained inside a continuation of the *ending* run. By
+	// dispatching here, every queued message gets its own fresh turn whose
+	// prompt is Telegram-originated (tagged in before_agent_start), so
+	// agent_start attaches it and agent_end delivers its reply properly.
+	pi.on("agent_settled", async (_event, ctx) => {
+		if (queuedTelegramTurns.length === 0 || preserveQueuedTurnsAsHistory) return;
+		if (!ctx.isIdle()) return;
+		const nextTurn = queuedTelegramTurns[0];
+		startTypingLoop(ctx, nextTurn.chatId);
+		updateStatus(ctx);
+		// No deliverAs on purpose — same reasoning as the idle dispatch in
+		// dispatchAuthorizedTelegramMessages: a raced send stays queued and is
+		// retried at the next agent_settled.
+		pi.sendUserMessage(nextTurn.content);
 	});
 }
